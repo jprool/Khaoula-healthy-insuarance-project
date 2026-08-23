@@ -1,0 +1,51 @@
+resources:
+
+  jobs:
+
+    health_insurance_job:
+      name: "Khaoula Healthy Insurance - End-to-End Workflow"
+
+      tasks:
+
+        # Claims branch
+
+        - task_key: ingest_claims
+          notebook_task:
+            notebook_path: ../../02-ingestion/02_01__kaggle_ingestion.ipynb
+
+
+        - task_key: claims_silver
+          depends_on:
+            - task_key: ingest_claims
+
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.claims_silver_pipeline.id}
+            full_refresh: false
+
+
+        # FHIR branch
+
+        - task_key: ingest_fhir
+          notebook_task:
+            notebook_path: ../../02-ingestion/02_02_fhir_api_ingestion_autoloader.ipynb
+
+
+        - task_key: fhir_silver
+          depends_on:
+            - task_key: ingest_fhir
+
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.fhir_silver_pipeline.id}
+            full_refresh: false
+
+
+        # Gold branch
+
+        - task_key: gold_analytics
+          depends_on:
+            - task_key: claims_silver
+            - task_key: fhir_silver
+
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.gold_analytics_pipeline.id}
+            full_refresh: false

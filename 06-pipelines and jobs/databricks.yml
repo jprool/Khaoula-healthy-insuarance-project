@@ -9,6 +9,7 @@ include:
 sync:
   paths:
     - .
+    - ../02-ingestion
     - ../03-silver-transformations
     - ../05-gold-transformations
     
