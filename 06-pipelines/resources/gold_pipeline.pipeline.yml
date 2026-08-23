@@ -1,0 +1,26 @@
+resources:
+
+  pipelines:
+
+    gold_analytics_pipeline:
+      name: "Khaoula Healthy Insurance - Gold Analytics"
+
+      catalog: health_insurance
+      schema: gold
+
+      serverless: true
+      continuous: false
+
+      libraries:
+
+        - notebook:
+            path: ../../05-gold-transformations/01_dimensions.ipynb
+
+        - notebook:
+            path: ../../05-gold-transformations/02_fact_claim.ipynb
+
+        - notebook:
+            path: ../../05-gold-transformations/03_analytics.ipynb
+
+        - notebook:
+            path: ../../05-gold-transformations/04_clinical_analytics.ipynb

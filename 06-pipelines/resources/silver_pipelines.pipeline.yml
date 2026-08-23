@@ -1,0 +1,37 @@
+resources:
+
+  pipelines:
+
+    claims_silver_pipeline:
+      name: "Khaoula Healthy Insurance - Claims Silver"
+
+      catalog: health_insurance
+      schema: silver
+
+      serverless: true
+      continuous: false
+
+      libraries:
+        - notebook:
+            path: ../../03-silver-transformations/03_01_claims_silver_lakeflow.ipynb
+
+
+    fhir_silver_pipeline:
+      name: "Khaoula Healthy Insurance - FHIR Silver"
+
+      catalog: health_insurance
+      schema: silver
+
+      serverless: true
+      continuous: false
+
+      libraries:
+
+        - notebook:
+            path: ../../03-silver-transformations/03_02_fhir_patient_silver_lakeflow.ipynb
+
+        - notebook:
+            path: ../../03-silver-transformations/03_03_fhir_condition_silver_lakeflow.ipynb
+
+        - notebook:
+            path: ../../03-silver-transformations/03_04_fhir_encounter_silver_lakeflow.ipynb
