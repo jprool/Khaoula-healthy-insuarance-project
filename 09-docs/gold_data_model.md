@@ -7,8 +7,8 @@ I designed the Gold layer as two separate analytical domains:
 1. Claims analytics
 2. FHIR clinical analytics
 
-The Claims domain follows a dimensional model with dimensions, a central fact
-table, and downstream analytical aggregates.
+The Claims domain follows a dimensional model with reusable dimensions, a
+central fact table, and downstream analytical aggregates.
 
 The FHIR domain remains separate because the FHIR Patient identifiers do not
 have a verified crosswalk to the Claims Patient identifiers.
@@ -63,6 +63,8 @@ erDiagram
         int claim_submission_delay_days
         boolean claim_submitted_late
         boolean is_fraudulent
+        boolean fraud_label_conflict
+        int source_record_count
     }
 ```
 
@@ -70,13 +72,31 @@ The central fact grain is:
 
 **one row per insurance claim**
 
+This grain is established in Silver before the Gold model is built.
+
+The raw Claims source contains repeated Claim records. Silver reconciles those
+records using the Claim's business attributes before Gold processing.
+
+When repeated source records agree on the fraud label, a single Claim is
+retained with that historical label.
+
+When repeated source records disagree only on the historical fraud label, the
+Claim is retained but:
+
+- `is_fraudulent` is set to `NULL`
+- `fraud_label_conflict` is set to `true`
+- `source_record_count` records how many Bronze records were reconciled
+
+This avoids arbitrarily selecting a conflicting source value while preserving
+the Claim itself for non-fraud analytics.
+
 ---
 
 # `dim_patient`
 
 ## Purpose
 
-`dim_patient` provides reusable patient attributes for Claims analytics.
+`dim_patient` provides reusable Patient attributes for Claims analytics.
 
 ## Grain
 
@@ -100,18 +120,22 @@ CLAIMS_PATIENT || patient_id
 
 ## Main attributes
 
-- patient ID
+- Patient ID
 - age
 - age group
 - gender
 - city
 - state
-- first observed claim date
-- latest observed claim date
-- historical claim count
+- first observed Claim date
+- latest observed Claim date
+- historical Claim count
 
 I derive the current demographic profile from the latest available Claim record
 for each Patient.
+
+Because Claim duplicates are reconciled in Silver before Gold processing,
+`historical_claim_count` represents reconciled Claims rather than duplicated
+source rows.
 
 ---
 
@@ -163,17 +187,29 @@ generation so the same profile always produces the same key.
 
 ## Purpose
 
-`fact_claim` is the central analytical fact table.
+`fact_claim` is the central analytical fact table for the Claims domain.
 
 ## Grain
 
-One row per insurance claim.
+One row per reconciled insurance Claim.
 
 ## Keys
 
 - `claim_key`
 - `patient_key`
 - `provider_key`
+
+`claim_key` is generated deterministically from the source `claim_id`.
+
+Conceptually:
+
+```text
+CLAIM || claim_id
+        ↓
+      SHA-256
+        ↓
+     claim_key
+```
 
 `patient_key` uses the same formula as `dim_patient`.
 
@@ -183,11 +219,24 @@ This provides stable fact-to-dimension relationships across pipeline refreshes.
 
 ## Financial measures
 
-- claim amount
+- Claim amount
 - deductible amount
 - copay amount
-- patient out-of-pocket amount
+- Patient out-of-pocket amount
 - estimated insurer amount
+
+`estimated_insurer_amount` is a derived analytical estimate:
+
+```text
+claim amount
+- deductible amount
+- copay amount
+```
+
+with a lower bound of zero.
+
+It should not be interpreted as an actual insurer payment supplied by the
+source system.
 
 ## Utilization measures
 
@@ -201,19 +250,43 @@ This provides stable fact-to-dimension relationships across pipeline refreshes.
 - previous Patient Claim count
 - previous Provider Claim count
 
-## Flags
+## Analytical and quality flags
 
 - Claim submitted late
 - historical fraud label
+- fraud-label conflict indicator
+- reconciled source-record count
 
 `is_fraudulent` is treated as a historical source label rather than a prediction
 produced by this project.
+
+When the source provides conflicting fraud labels for the same Claim,
+`is_fraudulent` is set to `NULL`.
+
+`fraud_label_conflict = true` explicitly identifies these Claims.
+
+`source_record_count` records how many Bronze source rows were consolidated into
+the final Silver Claim before it entered Gold.
+
+This allows downstream analytics to distinguish:
+
+```text
+all Claims
+```
+
+from:
+
+```text
+Claims with reliable historical fraud labels
+```
+
+without discarding otherwise valid Claim records.
 
 ---
 
 # Claims analytical products
 
-The fact model feeds three downstream analytical materialized views.
+The Claim fact model feeds three downstream analytical materialized views.
 
 ```mermaid
 flowchart TB
@@ -227,6 +300,14 @@ flowchart TB
     PROVIDER[dim_provider] --> PERF
 ```
 
+Fraud-related metrics follow one important rule:
+
+> Claims with conflicting fraud labels remain in general Claims analytics but
+> are excluded from fraud-rate denominators.
+
+This prevents an unresolved source-quality issue from being interpreted as a
+confirmed fraud or non-fraud outcome.
+
 ---
 
 ## `monthly_claim_kpis`
@@ -237,7 +318,8 @@ One row per Claim year-month.
 
 ### Purpose
 
-Monitor Claims activity over time.
+Monitor Claims activity, financial performance, submission behavior, and
+historical fraud trends over time.
 
 ### Metrics
 
@@ -245,12 +327,29 @@ Monitor Claims activity over time.
 - total Claim amount
 - average Claim amount
 - total Patient out-of-pocket amount
-- estimated insurer amount
+- total estimated insurer amount
+- fraud-labeled Claims
+- fraud-label conflicts
 - fraudulent Claims
 - fraud rate
 - late Claims
 - late-submission rate
 - average submission delay
+
+### Fraud-rate definition
+
+The fraud rate is calculated as:
+
+```text
+fraudulent Claims
+-------------------------- × 100
+fraud-labeled Claims
+```
+
+`fraud-labeled Claims` includes only Claims where `is_fraudulent` is not null.
+
+Claims with `fraud_label_conflict = true` therefore remain part of overall Claim
+volume but are not included in the fraud-rate denominator.
 
 ---
 
@@ -265,19 +364,46 @@ One row per:
 
 ### Purpose
 
-Analyze historical fraud patterns.
+Analyze historical fraud patterns while accounting for unreliable source fraud
+labels.
 
 ### Metrics
 
 - total Claims
 - total Claim amount
+- fraud-labeled Claims
+- fraud-label conflicts
 - fraudulent Claims
 - fraud rate
+- fraud-labeled Claim amount
 - fraudulent Claim amount
 - fraud Claim amount share
 - average fraudulent Claim amount
 
-This dataset summarizes fraud behavior but does not perform fraud prediction.
+### Fraud-rate definition
+
+```text
+fraudulent Claims
+-------------------------- × 100
+fraud-labeled Claims
+```
+
+### Fraud Claim amount share
+
+The financial fraud share is calculated using only Claim amounts that have a
+reliable fraud classification:
+
+```text
+fraudulent Claim amount
+-------------------------------- × 100
+fraud-labeled Claim amount
+```
+
+This avoids including Claims with unresolved fraud labels in the financial
+denominator.
+
+This dataset summarizes historical source labels and does not perform fraud
+prediction.
 
 ---
 
@@ -289,7 +415,8 @@ One row per Provider profile.
 
 ### Purpose
 
-Compare Provider activity and performance.
+Compare Provider activity, financial performance, operational behavior, and
+historical fraud patterns.
 
 ### Metrics
 
@@ -297,7 +424,9 @@ Compare Provider activity and performance.
 - distinct Patients
 - total Claim amount
 - average Claim amount
-- estimated insurer amount
+- total estimated insurer amount
+- fraud-labeled Claims
+- fraud-label conflicts
 - fraudulent Claims
 - fraud rate
 - late Claims
@@ -307,6 +436,52 @@ Compare Provider activity and performance.
 - average length of stay
 
 The model joins `fact_claim` to `dim_provider` through `provider_key`.
+
+Provider fraud rate follows the same reliability rule as the other Gold fraud
+products:
+
+```text
+fraudulent Claims
+-------------------------- × 100
+fraud-labeled Claims
+```
+
+This ensures a Provider is not penalized or favored because of unresolved
+source fraud labels.
+
+---
+
+# Claims data-quality flow
+
+Claims duplicate reconciliation occurs before Gold analytics.
+
+```mermaid
+flowchart TB
+
+    B[Bronze Claims<br/>Raw source records]
+
+    B --> S[Silver Claim reconciliation]
+
+    S --> EXACT[Exact duplicate records<br/>consolidated]
+    S --> CONFLICT[Fraud-label conflicts<br/>identified]
+
+    EXACT --> C[One reconciled Claim]
+    CONFLICT --> C
+
+    C --> F[Gold fact_claim]
+
+    F --> GENERAL[General Claims analytics]
+    F --> FRAUD[Fraud analytics]
+
+    FRAUD --> RULE[Use only reliable fraud labels<br/>for fraud-rate denominators]
+```
+
+Bronze remains the immutable representation of what arrived from the source.
+
+Silver resolves business-record duplication and identifies uncertainty.
+
+Gold exposes the resulting quality metadata so analytical products can use the
+data appropriately.
 
 ---
 
@@ -341,7 +516,8 @@ flowchart TB
 
 One row per FHIR Patient.
 
-I aggregate Conditions and Encounters before joining them to Patient.
+I aggregate Conditions and Encounters independently to the Patient grain before
+joining them to Patient.
 
 This prevents row multiplication caused by joining multiple one-to-many
 relationships directly.
@@ -410,8 +586,8 @@ controls.
 - active Conditions
 - resolved Conditions
 - confirmed Conditions
-- first condition onset
-- latest condition onset
+- first Condition onset
+- latest Condition onset
 - active-condition indicator
 
 ---
@@ -464,9 +640,9 @@ This design avoids introducing false relationships into the Gold model.
 |---|---|---|
 | `dim_patient` | one Claims Patient | Dimension |
 | `dim_provider` | one Provider profile | Dimension |
-| `fact_claim` | one Claim | Fact |
-| `monthly_claim_kpis` | one month | Aggregate |
-| `fraud_summary` | Claim band + service type | Aggregate |
+| `fact_claim` | one reconciled Claim | Fact |
+| `monthly_claim_kpis` | one Claim year-month | Aggregate |
+| `fraud_summary` | Claim amount band + service type | Aggregate |
 | `provider_performance` | one Provider profile | Aggregate |
 | `patient_clinical_summary` | one FHIR Patient | Clinical aggregate |
 
@@ -478,10 +654,34 @@ This design avoids introducing false relationships into the Gold model.
 
 I define the grain of every Gold dataset before creating its transformations.
 
+For the Claims fact table, the one-row-per-Claim grain is established through
+Silver Claim reconciliation before Gold processing.
+
+## Preserve raw source truth
+
+I preserve raw source records in Bronze rather than silently removing source
+quality issues during ingestion.
+
+## Resolve quality issues explicitly
+
+I resolve duplicate business records in Silver and retain metadata describing
+how that reconciliation occurred.
+
+When a source attribute is genuinely ambiguous, I represent that uncertainty
+instead of inventing a value.
+
 ## Deterministic keys
 
-I use deterministic surrogate keys so dimensional relationships are reproducible
-across pipeline refreshes.
+I use deterministic surrogate keys so dimensional relationships are
+reproducible across pipeline refreshes.
+
+## Reliable analytical denominators
+
+Fraud-rate metrics use only Claims with a reliable historical fraud label as
+their denominator.
+
+Claims with ambiguous fraud labels remain available for other valid analytical
+purposes.
 
 ## Reduced duplication
 
@@ -493,6 +693,8 @@ than being repeated unnecessarily throughout the Claim fact.
 I do not combine independent source systems without evidence of a valid
 relationship.
 
+The Claims and FHIR Patient domains therefore remain separate.
+
 ## Analytical usability
 
 I create pre-aggregated Gold datasets for common reporting use cases such as:
@@ -501,3 +703,6 @@ I create pre-aggregated Gold datasets for common reporting use cases such as:
 - fraud analysis
 - Provider performance
 - Patient clinical history
+
+This provides analysis-ready datasets while preserving clear lineage back to
+the validated Silver layer.
